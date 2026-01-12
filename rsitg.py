@@ -7,6 +7,16 @@ import pandas as pd
 import pandas_ta as ta
 from datetime import datetime
 import pytz
+import logging
+
+# ==================== 0. LOGGING CONFIGURATION ====================
+# This sets up the console output format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # ==================== 1. CONFIGURATION ====================
 SYMBOL = 'SOLUSDT'
@@ -34,7 +44,8 @@ async def update_telegram(msg, msg_id=None):
         else:
             sent = await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
             return sent.message_id
-    except Exception:
+    except Exception as e:
+        logger.error(f"❌ Telegram Error: {e}")
         return msg_id
 
 # ==================== 3. DATA ENGINE ====================
@@ -42,14 +53,26 @@ async def update_telegram(msg, msg_id=None):
 async def fetch_indicators():
     try:
         url = "https://api.binance.com/api/v3/klines"
-        params = {'symbol': SYMBOL, 'interval': '15m', 'limit': 500}
+        params = {'symbol': SYMBOL, 'interval': '15m', 'limit': 100}
         resp = requests.get(url, params=params, timeout=10)
+        
+        if resp.status_code != 200:
+            logger.error(f"Binance API returned status {resp.status_code}")
+            return None, None, None, None
+
         df = pd.DataFrame(resp.json(), columns=['ts', 'o', 'h', 'l', 'c', 'v', 'ts_e', 'q', 'n', 'tb', 'tq', 'i'])
         df['close'] = df['c'].astype(float)
+        
         rsi = ta.rsi(df['close'], length=RSI_PERIOD)
         rsi_ema = ta.ema(rsi, length=EMA_RSI_PERIOD)
-        return rsi.iloc[-1], rsi_ema.iloc[-1], rsi.iloc[-2], rsi_ema.iloc[-2]
-    except:
+        
+        curr_rsi, curr_ema = rsi.iloc[-1], rsi_ema.iloc[-1]
+        prev_rsi, prev_ema = rsi.iloc[-2], rsi_ema.iloc[-2]
+        
+        logger.info(f"🔍 RSI: {curr_rsi:.2f} | EMA: {curr_ema:.2f}")
+        return curr_rsi, curr_ema, prev_rsi, prev_ema
+    except Exception as e:
+        logger.error(f"Error fetching indicators: {e}")
         return None, None, None, None
 
 # ==================== 4. TRADE MONITORING ====================
@@ -70,6 +93,7 @@ async def monitor_trade(price):
         active_trade['sl'] = active_trade['entry'] + (risk_dist * 0.5)
         active_trade['sl_at_recovery'] = True
         active_trade['log'] += f"\n🛡️ *SL moved to +0.5R*"
+        logger.info(f"🛡️ Risk managed: SL moved to {active_trade['sl']:.2f}")
         status_updated = True
 
     # 2. Partial Exit (2.1R)
@@ -80,18 +104,20 @@ async def monitor_trade(price):
         active_trade['sl'] = active_trade['entry'] + (risk_dist * 1.5)
         active_trade['last_trail_price'] = price 
         active_trade['log'] += f"\n💰 *Partial Exit:* Banked 70% (${profit_70:.2f})"
+        logger.info(f"💰 Partial Profit Taken: Banked ${profit_70:.2f}")
         status_updated = True
 
-    # 3. Dynamic Trailing (0.40% Trigger -> 0.20% SL Move)
+    # 3. Dynamic Trailing
     if active_trade.get('partial_done'):
         if price >= (active_trade['last_trail_price'] * 1.0040):
             active_trade['sl'] *= 1.0020
             active_trade['last_trail_price'] = price
             active_trade['log'] += f"\n📈 *Trail:* SL Up 0.20%"
+            logger.info(f"📈 Trailing SL up to: {active_trade['sl']:.2f}")
             status_updated = True
 
     # Dashboard Update Logic
-    if status_updated or abs(price - active_trade.get('last_msg_price', 0)) > (price * 0.001):
+    if status_updated or abs(price - active_trade.get('last_msg_price', 0)) > (price * 0.002):
         active_trade['last_msg_price'] = price
         win_rate = (stats['wins'] / stats['total_trades'] * 100) if stats['total_trades'] > 0 else 0
         
@@ -107,19 +133,20 @@ async def monitor_trade(price):
                f"{active_trade['log']}")
         await update_telegram(msg, active_trade['msg_id'])
 
-    # 4. Final Exit & Stats Update
+    # 4. Final Exit
     if price <= active_trade['sl']:
         pnl_rem = ((price - active_trade['entry']) / risk_dist * active_trade['risk_usd']) * 0.30
         stats['balance'] += pnl_rem
         stats['total_trades'] += 1
         
-        # Decide if overall trade was a Win or Loss (based on total profit)
         if price > active_trade['entry']:
             stats['wins'] += 1
             result_tag = "✅ PROFIT"
         else:
             stats['losses'] += 1
             result_tag = "🛑 STOPPED"
+
+        logger.info(f"🏁 Trade Closed: {result_tag} | Final Balance: ${stats['balance']:.2f}")
 
         exit_msg = (f"🏁 *{result_tag}*\n"
                     f"━━━━━━━━━━━━━━\n"
@@ -135,30 +162,47 @@ async def monitor_trade(price):
 
 async def main():
     global active_trade
-    print(f"🚀 Bot Active IST: {get_ist_now()}")
+    logger.info(f"🚀 Bot Starting... Monitoring {SYMBOL} on 15m RSI/EMA crossover.")
     uri = f"wss://stream.binance.com:9443/ws/{SYMBOL.lower()}@kline_1m"
     
     async with websockets.connect(uri) as ws:
         while True:
-            data = json.loads(await ws.recv())
-            if 'k' in data:
-                price = float(data['k']['c'])
-                if active_trade: await monitor_trade(price)
-                
-                if data['k']['x']: # New candle
-                    rsi, rsi_ema, prsi, pema = await fetch_indicators()
-                    if not active_trade and rsi and prsi:
-                        if prsi <= pema and rsi > rsi_ema:
-                            resp = requests.get(f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval=15m&limit=1").json()
-                            low = float(resp[0][3]) * 0.9995
-                            risk = stats['balance'] * 0.05
-                            active_trade = {
-                                'entry': price, 'initial_sl': low, 'sl': low,
-                                'tp': price + ((price - low) * 2.1), 'risk_usd': risk,
-                                'partial_done': False, 'sl_at_recovery': False,
-                                'log': f"🚀 *Entry:* `${price:.2f}`", 'last_msg_price': price
-                            }
-                            active_trade['msg_id'] = await update_telegram("⏳ Opening Trade...")
+            try:
+                data = json.loads(await ws.recv())
+                if 'k' in data:
+                    price = float(data['k']['c'])
+                    
+                    if active_trade:
+                        await monitor_trade(price)
+                    
+                    if data['k']['x']: # New 1m candle closed
+                        logger.info(f"⏰ 1m Candle Closed. Price: {price}. Checking Signal...")
+                        rsi, rsi_ema, prsi, pema = await fetch_indicators()
+                        
+                        if not active_trade and rsi and prsi:
+                            # Check for Bullish Crossover
+                            if prsi <= pema and rsi > rsi_ema:
+                                logger.info("⚡ BULLISH CROSSOVER DETECTED! Opening Position...")
+                                
+                                # Fetch 15m low for SL
+                                resp = requests.get(f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval=15m&limit=1").json()
+                                low = float(resp[0][3]) * 0.9995
+                                risk = stats['balance'] * 0.05
+                                
+                                active_trade = {
+                                    'entry': price, 'initial_sl': low, 'sl': low,
+                                    'tp': price + ((price - low) * 2.1), 'risk_usd': risk,
+                                    'partial_done': False, 'sl_at_recovery': False,
+                                    'log': f"🚀 *Entry:* `${price:.2f}`", 'last_msg_price': price
+                                }
+                                active_trade['msg_id'] = await update_telegram("⏳ Opening Trade...")
+                                logger.info(f"✅ Trade Opened at {price} | SL: {low:.2f} | Risk: ${risk:.2f}")
+            except Exception as e:
+                logger.error(f"Main Loop Error: {e}")
+                await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
