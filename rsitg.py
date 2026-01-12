@@ -15,24 +15,16 @@ EMA_RSI_PERIOD = 9
 TELEGRAM_TOKEN = '7669372307:AAGyLdhMomWfKEoYSDVqvYs2FLn1mCIFhHs'
 CHAT_ID = '1950462171'
 
-# Timezone & Stats
 IST = pytz.timezone('Asia/Kolkata')
 stats = {"balance": 1000.0, "wins": 0, "losses": 0, "total_trades": 0}
 
-# Global State
 active_trade = None  
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# ==================== 2. UTILS & TIME ====================
+# ==================== 2. UTILS ====================
 
 def get_ist_now():
-    """Returns system time in IST."""
     return datetime.now(IST).strftime('%H:%M:%S')
-
-def format_ist(ms):
-    """Converts Binance Unix MS to IST string."""
-    dt_utc = datetime.fromtimestamp(ms/1000.0, tz=pytz.UTC)
-    return dt_utc.astimezone(IST).strftime('%H:%M:%S')
 
 async def update_telegram(msg, msg_id=None):
     try:
@@ -42,29 +34,22 @@ async def update_telegram(msg, msg_id=None):
         else:
             sent = await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
             return sent.message_id
-    except Exception as e:
-        print(f"⚠️ TG Error: {e}")
+    except Exception:
         return msg_id
 
 # ==================== 3. DATA ENGINE ====================
 
 async def fetch_indicators():
-    """Fetches 500 candles to ensure RSI matches TradingView exactly."""
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {'symbol': SYMBOL, 'interval': '15m', 'limit': 500}
         resp = requests.get(url, params=params, timeout=10)
         df = pd.DataFrame(resp.json(), columns=['ts', 'o', 'h', 'l', 'c', 'v', 'ts_e', 'q', 'n', 'tb', 'tq', 'i'])
         df['close'] = df['c'].astype(float)
-        
-        # Wilder's RSI calculation (TV Style)
         rsi = ta.rsi(df['close'], length=RSI_PERIOD)
-        # Signal Line (EMA of RSI)
         rsi_ema = ta.ema(rsi, length=EMA_RSI_PERIOD)
-        
         return rsi.iloc[-1], rsi_ema.iloc[-1], rsi.iloc[-2], rsi_ema.iloc[-2]
-    except Exception as e:
-        print(f"❌ API Error: {e}")
+    except:
         return None, None, None, None
 
 # ==================== 4. TRADE MONITORING ====================
@@ -74,76 +59,106 @@ async def monitor_trade(price):
     if not active_trade: return
 
     risk_dist = active_trade['entry'] - active_trade['initial_sl']
+    reward_dist = price - active_trade['entry']
+    rr_ratio = reward_dist / risk_dist if risk_dist != 0 else 0
+    pct_change = (reward_dist / active_trade['entry']) * 100
+    
     status_updated = False
     
     # 1. Fee Recovery (1.5R)
-    if not active_trade['sl_at_recovery'] and price >= (active_trade['entry'] + (risk_dist * 1.5)):
+    if not active_trade['sl_at_recovery'] and rr_ratio >= 1.5:
         active_trade['sl'] = active_trade['entry'] + (risk_dist * 0.5)
         active_trade['sl_at_recovery'] = True
-        active_trade['log'] += f"\n🛡️ *1.5x Reached:* SL moved to +0.5R"
+        active_trade['log'] += f"\n🛡️ *SL moved to +0.5R*"
         status_updated = True
 
     # 2. Partial Exit (2.1R)
-    if not active_trade['partial_done'] and price >= active_trade['tp']:
+    if not active_trade['partial_done'] and rr_ratio >= 2.1:
         profit_70 = (active_trade['risk_usd'] * 2.1) * 0.70
         stats['balance'] += profit_70
         active_trade['partial_done'] = True
         active_trade['sl'] = active_trade['entry'] + (risk_dist * 1.5)
-        active_trade['log'] += f"\n💰 *Partial Exit:* Banked ${profit_70:.2f}"
+        active_trade['last_trail_price'] = price 
+        active_trade['log'] += f"\n💰 *Partial Exit:* Banked 70% (${profit_70:.2f})"
         status_updated = True
 
-    if status_updated:
-        msg = f"📊 *Live {SYMBOL}*\nPrice: ${price:.2f}\nSL: ${active_trade['sl']:.2f}\n{active_trade['log']}"
+    # 3. Dynamic Trailing (0.40% Trigger -> 0.20% SL Move)
+    if active_trade.get('partial_done'):
+        if price >= (active_trade['last_trail_price'] * 1.0040):
+            active_trade['sl'] *= 1.0020
+            active_trade['last_trail_price'] = price
+            active_trade['log'] += f"\n📈 *Trail:* SL Up 0.20%"
+            status_updated = True
+
+    # Dashboard Update Logic
+    if status_updated or abs(price - active_trade.get('last_msg_price', 0)) > (price * 0.001):
+        active_trade['last_msg_price'] = price
+        win_rate = (stats['wins'] / stats['total_trades'] * 100) if stats['total_trades'] > 0 else 0
+        
+        msg = (f"📊 *Live {SYMBOL} Dashboard*\n"
+               f"━━━━━━━━━━━━━━\n"
+               f"💵 *Price:* `${price:.2f}`\n"
+               f"🛑 *SL:* `${active_trade['sl']:.2f}` | 🎯 *TP:* `${active_trade['tp']:.2f}`\n"
+               f"⚖️ *RR:* `{rr_ratio:.2f}R` | 📈 *P/L:* `{pct_change:+.2f}%` \n"
+               f"━━━━━━━━━━━━━━\n"
+               f"🏆 *Wins:* `{stats['wins']}` | ❌ *Losses:* `{stats['losses']}`\n"
+               f"📊 *Win Rate:* `{win_rate:.1f}%` | 💰 *Bal:* `${stats['balance']:.2f}`\n"
+               f"━━━━━━━━━━━━━━\n"
+               f"{active_trade['log']}")
         await update_telegram(msg, active_trade['msg_id'])
 
-    # 3. Final Exit
+    # 4. Final Exit & Stats Update
     if price <= active_trade['sl']:
-        pnl = (price - active_trade['entry']) / risk_dist * active_trade['risk_usd']
-        stats['balance'] += pnl
-        result = "✅ WIN" if pnl > 0 else "🛑 LOSS"
-        await bot.send_message(chat_id=CHAT_ID, text=f"{result}\nPnL: ${pnl:.2f}\nBal: ${stats['balance']:.2f}")
+        pnl_rem = ((price - active_trade['entry']) / risk_dist * active_trade['risk_usd']) * 0.30
+        stats['balance'] += pnl_rem
+        stats['total_trades'] += 1
+        
+        # Decide if overall trade was a Win or Loss (based on total profit)
+        if price > active_trade['entry']:
+            stats['wins'] += 1
+            result_tag = "✅ PROFIT"
+        else:
+            stats['losses'] += 1
+            result_tag = "🛑 STOPPED"
+
+        exit_msg = (f"🏁 *{result_tag}*\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"⚖️ *Final RR:* `{rr_ratio:.2f}R`\n"
+                    f"💵 *Rem. PnL:* `${pnl_rem:+.2f}`\n"
+                    f"🏆 *Total Wins:* `{stats['wins']}` | ❌ *Losses:* `{stats['losses']}`\n"
+                    f"💰 *Final Wallet:* `${stats['balance']:.2f}`")
+        
+        await bot.send_message(chat_id=CHAT_ID, text=exit_msg, parse_mode='Markdown')
         active_trade = None
 
 # ==================== 5. MAIN LOOP ====================
 
 async def main():
     global active_trade
-    print(f"🚀 Bot Live Painting at {get_ist_now()} IST")
-    
+    print(f"🚀 Bot Active IST: {get_ist_now()}")
     uri = f"wss://stream.binance.com:9443/ws/{SYMBOL.lower()}@kline_1m"
+    
     async with websockets.connect(uri) as ws:
         while True:
-            raw_data = await ws.recv()
-            data = json.loads(raw_data)
-            
+            data = json.loads(await ws.recv())
             if 'k' in data:
                 price = float(data['k']['c'])
-                candle_time = format_ist(data['k']['t'])
-                
                 if active_trade: await monitor_trade(price)
-
-                # LIVE PAINTING: Refresh indicators every 1m or on 15m close
-                if data['k']['x']: # This executes every time a 1m candle closes
+                
+                if data['k']['x']: # New candle
                     rsi, rsi_ema, prsi, pema = await fetch_indicators()
-                    
-                    # LOGGING
-                    print(f"[{candle_time}] Price: {price} | RSI: {rsi:.2f} | EMA: {rsi_ema:.2f}")
-                    
-                    # ENTRY LOGIC (Only if no active trade)
                     if not active_trade and rsi and prsi:
-                        if prsi <= pema and rsi > rsi_ema: # CROSSOVER
-                            # Get 15m Low for SL
-                            resp = requests.get(f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval=15m&limit=1")
-                            low = float(resp.json()[0][3]) * 0.9995
-                            
+                        if prsi <= pema and rsi > rsi_ema:
+                            resp = requests.get(f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval=15m&limit=1").json()
+                            low = float(resp[0][3]) * 0.9995
                             risk = stats['balance'] * 0.05
                             active_trade = {
                                 'entry': price, 'initial_sl': low, 'sl': low,
                                 'tp': price + ((price - low) * 2.1), 'risk_usd': risk,
                                 'partial_done': False, 'sl_at_recovery': False,
-                                'log': f"🚀 *Entry:* ${price:.2f}"
+                                'log': f"🚀 *Entry:* `${price:.2f}`", 'last_msg_price': price
                             }
-                            active_trade['msg_id'] = await update_telegram(active_trade['log'])
+                            active_trade['msg_id'] = await update_telegram("⏳ Opening Trade...")
 
 if __name__ == "__main__":
     asyncio.run(main())
