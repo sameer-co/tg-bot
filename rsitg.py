@@ -5,20 +5,17 @@ import telegram
 import requests
 import pandas as pd
 import pandas_ta as ta
-from datetime import datetime
-import pytz
 import logging
 import sys
 
-# ==================== 0. RAILWAY LOGGING SETUP ====================
+# ==================== LOGGING SETUP ====================
 class RailwayJSONFormatter(logging.Formatter):
     def format(self, record):
-        log_entry = {
+        return json.dumps({
             "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%SZ"),
             "level": record.levelname.lower(),
             "message": record.getMessage(),
-        }
-        return json.dumps(log_entry)
+        })
 
 logger = logging.getLogger("BotEngine")
 logger.setLevel(logging.INFO)
@@ -26,32 +23,25 @@ console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(RailwayJSONFormatter())
 logger.addHandler(console_handler)
 
-# ==================== 1. CONFIGURATION ====================
+# ==================== CONFIGURATION ====================
 SYMBOL = 'SOLUSDT'
 RSI_PERIOD = 14
 EMA_RSI_PERIOD = 9
 TELEGRAM_TOKEN = '7669372307:AAGyLdhMomWfKEoYSDVqvYs2FLn1mCIFhHs'
 CHAT_ID = '1950462171'
 
-stats = {"balance": 1000.0, "wins": 0, "losses": 0, "total_trades": 0}
+# Stats and Capital Tracking
+stats = {
+    "balance": 1000.0, 
+    "risk_percent": 0.02, # 2% risk
+    "wins": 0, 
+    "losses": 0, 
+    "total_trades": 0
+}
 active_trade = None  
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# ==================== 2. UTILS ====================
-
-async def update_telegram(msg, msg_id=None):
-    try:
-        if msg_id:
-            await bot.edit_message_text(chat_id=CHAT_ID, message_id=msg_id, text=msg, parse_mode='Markdown')
-            return msg_id
-        else:
-            sent = await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-            return sent.message_id
-    except Exception as e:
-        logger.error(f"TELEGRAM_ERROR: {str(e)}")
-        return msg_id
-
-# ==================== 3. DATA ENGINE ====================
+# ==================== DATA ENGINE ====================
 
 async def fetch_indicators():
     try:
@@ -67,65 +57,65 @@ async def fetch_indicators():
         logger.error(f"FETCH_ERROR: {str(e)}")
         return None, None, None, None
 
-# ==================== 4. TRADE MANAGEMENT ====================
+# ==================== TRADE MANAGEMENT ====================
 
 async def monitor_trade(price):
-    global active_trade, stats
+    global active_trade
     if not active_trade: return
 
+    # Calculate Current Risk/Reward (RR) Ratio
     risk_dist = active_trade['entry'] - active_trade['initial_sl']
     reward_dist = price - active_trade['entry']
-    rr_ratio = reward_dist / risk_dist if risk_dist != 0 else 0
-    
-    # Logic: Move SL to protection and Partial Exit
-    if not active_trade['sl_at_recovery'] and rr_ratio >= 1.5:
+    rr_ratio = reward_dist / risk_dist if risk_dist > 0 else 0
+
+    # 1. TRAILING LOGIC: Price hit 1.5R -> Move SL to +0.5R
+    if not active_trade['sl_trailed'] and rr_ratio >= 1.5:
         active_trade['sl'] = active_trade['entry'] + (risk_dist * 0.5)
-        active_trade['sl_at_recovery'] = True
-        logger.info("SL moved to +0.5R")
+        active_trade['sl_trailed'] = True
+        logger.info(f"TRAIL: SL moved to +0.5R at {active_trade['sl']:.2f}")
 
-    if not active_trade['partial_done'] and rr_ratio >= 2.1:
-        profit_70 = (active_trade['risk_usd'] * 2.1) * 0.70
-        stats['balance'] += profit_70
-        active_trade['partial_done'] = True
-        active_trade['sl'] = active_trade['entry'] + (risk_dist * 1.5)
-        logger.info("Partial exit 70% completed.")
+    # 2. EXIT LOGIC: Target (2.2R) or current SL hit
+    if rr_ratio >= 2.2:
+        await close_trade(price, "🎯 TARGET HIT (2.2R)")
+    elif price <= active_trade['sl']:
+        reason = "🛡️ TRAILING STOP (+0.5R)" if active_trade['sl_trailed'] else "🛑 STOP LOSS"
+        await close_trade(price, reason)
 
-    # EXIT TRIGGER
-    if price <= active_trade['sl']:
-        # Final PnL Calculation
-        pnl_rem = ((price - active_trade['entry']) / risk_dist * active_trade['risk_usd']) * 0.30
-        stats['balance'] += pnl_rem
-        stats['total_trades'] += 1
-        
-        is_win = price > active_trade['entry']
-        if is_win: stats['wins'] += 1
-        else: stats['losses'] += 1
-        
-        win_rate = (stats['wins'] / stats['total_trades']) * 100
-        result_icon = "✅ PROFIT" if is_win else "🛑 LOSS/STOP"
+async def close_trade(exit_price, reason):
+    global active_trade, stats
+    
+    # Calculate PnL based on the original dollar risk
+    risk_dist = active_trade['entry'] - active_trade['initial_sl']
+    achieved_rr = (exit_price - active_trade['entry']) / risk_dist
+    pnl = achieved_rr * active_trade['risk_usd']
+    
+    stats['balance'] += pnl
+    stats['total_trades'] += 1
+    if pnl > 0: stats['wins'] += 1
+    else: stats['losses'] += 1
+    
+    win_rate = (stats['wins'] / stats['total_trades']) * 100
+    
+    exit_msg = (
+        f"🏁 *TRADE CLOSED: {reason}*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 *Entry:* `${active_trade['entry']:.2f}`\n"
+        f"🏁 *Exit:* `${exit_price:.2f}`\n"
+        f"💵 *PnL:* `{pnl:+.2f} USDT`\n"
+        f"🏦 *New Balance:* `${stats['balance']:.2f}`\n\n"
+        f"📊 *Lifetime Stats:*\n"
+        f"✅ Wins: `{stats['wins']}` | 🛑 Losses: `{stats['losses']}`\n"
+        f"📈 Win Rate: `{win_rate:.1f}%`"
+    )
+    await bot.send_message(chat_id=CHAT_ID, text=exit_msg, parse_mode='Markdown')
+    logger.info(f"CLOSED: {reason} | PnL: {pnl:.2f}")
+    active_trade = None
 
-        # --- TELEGRAM RESULT MESSAGE ---
-        result_msg = (
-            f"{result_icon} *Trade Result Summary*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💰 *Entry:* `${active_trade['entry']:.2f}`\n"
-            f"🏁 *Exit:* `${price:.2f}`\n"
-            f"🎯 *Initial Target:* `${active_trade['tp']:.2f}`\n"
-            f"💵 *Final Balance:* `${stats['balance']:.2f}`\n\n"
-            f"📊 *Bot Statistics:*\n"
-            f"Wins: `{stats['wins']}` | Losses: `{stats['losses']}`\n"
-            f"Win Rate: `{win_rate:.1f}%`"
-        )
-        
-        await bot.send_message(chat_id=CHAT_ID, text=result_msg, parse_mode='Markdown')
-        logger.info(f"TRADE_CLOSED: Result={result_icon}")
-        active_trade = None
-
-# ==================== 5. MAIN EXECUTION ====================
+# ==================== MAIN EXECUTION ====================
 
 async def main():
     global active_trade
-    logger.info("SYSTEM_BOOT: Bot Online.")
+    logger.info("SYSTEM_BOOT: Bot Online. Capital: $1000, Risk: 2% ($20)")
     uri = f"wss://stream.binance.com:9443/ws/{SYMBOL.lower()}@kline_1m"
     
     while True:
@@ -141,27 +131,29 @@ async def main():
                             rsi, rsi_ema, prsi, pema = await fetch_indicators()
                             if rsi and not active_trade:
                                 if prsi <= pema and rsi > rsi_ema:
-                                    # Setup SL and TP
+                                    # Setup Parameters
                                     resp = requests.get(f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval=15m&limit=1").json()
-                                    low = float(resp[0][3]) * 0.9995
-                                    tp = price + ((price - low) * 2.1)
-                                    risk = stats['balance'] * 0.05
+                                    low_price = float(resp[0][3]) * 0.9995 
+                                    tp_price = price + ((price - low_price) * 2.2)
+                                    risk_amount = stats['balance'] * stats['risk_percent'] # $20
                                     
                                     active_trade = {
-                                        'entry': price, 'initial_sl': low, 'sl': low,
-                                        'tp': tp, 'risk_usd': risk,
-                                        'partial_done': False, 'sl_at_recovery': False
+                                        'entry': price, 'initial_sl': low_price, 'sl': low_price,
+                                        'tp': tp_price, 'risk_usd': risk_amount, 'sl_trailed': False
                                     }
                                     
                                     entry_msg = (
-                                        f"🚀 *LONG SIGNAL DETECTED*\n"
+                                        f"🚀 *LONG SIGNAL: {SYMBOL}*\n"
                                         f"━━━━━━━━━━━━━━━━━━\n"
                                         f"💰 *Entry:* `${price:.2f}`\n"
-                                        f"🎯 *Target (TP):* `${tp:.2f}`\n"
-                                        f"🛑 *Stop Loss (SL):* `${low:.2f}`"
+                                        f"🎯 *Target (2.2R):* `${tp_price:.2f}`\n"
+                                        f"🛑 *Stop Loss:* `${low_price:.2f}`\n"
+                                        f"📏 *Risk per Trade:* `${risk_amount:.2f}`\n\n"
+                                        f"📊 *Current Stats:*\n"
+                                        f"✅ Wins: `{stats['wins']}` | 🛑 Losses: `{stats['losses']}`"
                                     )
-                                    await update_telegram(entry_msg)
-                                    logger.info(f"SIGNAL_OPENED: TP={tp:.2f}")
+                                    await bot.send_message(chat_id=CHAT_ID, text=entry_msg, parse_mode='Markdown')
+                                    logger.info(f"SIGNAL_OPENED: TP={tp_price:.2f}")
 
         except Exception as e:
             logger.error(f"RECONNECTING: {str(e)}")
