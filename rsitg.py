@@ -33,12 +33,12 @@ CHAT_ID = '1950462171'
 
 # Stats and Capital Tracking
 stats = {
-    "balance": 1000.0, 
+    "balance": 825.0, 
     "risk_percent": 0.02, # 2% risk
-    "wins": 0, 
-    "losses": 0, 
-    "total_trades": 0,
-    "trailed_trades": 0  # NEW: Tracks how many times SL was moved to profit
+    "wins": 12, 
+    "losses": 38, 
+    "total_trades": 62,
+    "trailed_trades": 12  # NEW: Tracks how many times SL was moved to profit
 }
 active_trade = None  
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
