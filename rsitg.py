@@ -27,6 +27,7 @@ logger.addHandler(console_handler)
 SYMBOL = 'SOLUSDT'
 RSI_PERIOD = 14
 EMA_RSI_PERIOD = 9
+# WARNING: Keep these secret! Use environment variables in production.
 TELEGRAM_TOKEN = '8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE'
 CHAT_ID = '1950462171'
 
@@ -36,7 +37,8 @@ stats = {
     "risk_percent": 0.02, # 2% risk
     "wins": 0, 
     "losses": 0, 
-    "total_trades": 0
+    "total_trades": 0,
+    "trailed_trades": 0  # NEW: Tracks how many times SL was moved to profit
 }
 active_trade = None  
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
@@ -60,7 +62,7 @@ async def fetch_indicators():
 # ==================== TRADE MANAGEMENT ====================
 
 async def monitor_trade(price):
-    global active_trade
+    global active_trade, stats
     if not active_trade: return
 
     # Calculate Current Risk/Reward (RR) Ratio
@@ -68,17 +70,19 @@ async def monitor_trade(price):
     reward_dist = price - active_trade['entry']
     rr_ratio = reward_dist / risk_dist if risk_dist > 0 else 0
 
-    # 1. TRAILING LOGIC: Price hit 1.5R -> Move SL to +0.5R
+    # 1. TRAILING LOGIC: Price hit 1.5R -> Move SL to +0.8R
     if not active_trade['sl_trailed'] and rr_ratio >= 1.5:
-        active_trade['sl'] = active_trade['entry'] + (risk_dist * 0.5)
+        # Changed from 0.5 to 0.8 as requested
+        active_trade['sl'] = active_trade['entry'] + (risk_dist * 0.8)
         active_trade['sl_trailed'] = True
-        logger.info(f"TRAIL: SL moved to +0.5R at {active_trade['sl']:.2f}")
+        stats['trailed_trades'] += 1 # NEW: Increment trailing state
+        logger.info(f"TRAIL: SL moved to +0.8R at {active_trade['sl']:.2f}")
 
     # 2. EXIT LOGIC: Target (2.2R) or current SL hit
     if rr_ratio >= 2.2:
         await close_trade(price, "🎯 TARGET HIT (2.2R)")
     elif price <= active_trade['sl']:
-        reason = "🛡️ TRAILING STOP (+0.5R)" if active_trade['sl_trailed'] else "🛑 STOP LOSS"
+        reason = "🛡️ TRAILING STOP (+0.8R)" if active_trade['sl_trailed'] else "🛑 STOP LOSS"
         await close_trade(price, reason)
 
 async def close_trade(exit_price, reason):
@@ -105,6 +109,7 @@ async def close_trade(exit_price, reason):
         f"🏦 *New Balance:* `${stats['balance']:.2f}`\n\n"
         f"📊 *Lifetime Stats:*\n"
         f"✅ Wins: `{stats['wins']}` | 🛑 Losses: `{stats['losses']}`\n"
+        f"🔄 Trailed: `{stats['trailed_trades']}`\n" # NEW: Show trailing count
         f"📈 Win Rate: `{win_rate:.1f}%`"
     )
     await bot.send_message(chat_id=CHAT_ID, text=exit_msg, parse_mode='Markdown')
@@ -135,7 +140,7 @@ async def main():
                                     resp = requests.get(f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval=15m&limit=1").json()
                                     low_price = float(resp[0][3]) * 0.9995 
                                     tp_price = price + ((price - low_price) * 2.2)
-                                    risk_amount = stats['balance'] * stats['risk_percent'] # $20
+                                    risk_amount = stats['balance'] * stats['risk_percent']
                                     
                                     active_trade = {
                                         'entry': price, 'initial_sl': low_price, 'sl': low_price,
@@ -150,7 +155,8 @@ async def main():
                                         f"🛑 *Stop Loss:* `${low_price:.2f}`\n"
                                         f"📏 *Risk per Trade:* `${risk_amount:.2f}`\n\n"
                                         f"📊 *Current Stats:*\n"
-                                        f"✅ Wins: `{stats['wins']}` | 🛑 Losses: `{stats['losses']}`"
+                                        f"✅ Wins: `{stats['wins']}` | 🛑 Losses: `{stats['losses']}`\n"
+                                        f"🔄 Trailed: `{stats['trailed_trades']}`"
                                     )
                                     await bot.send_message(chat_id=CHAT_ID, text=entry_msg, parse_mode='Markdown')
                                     logger.info(f"SIGNAL_OPENED: TP={tp_price:.2f}")
