@@ -18,7 +18,7 @@ TELEGRAM_TOKEN = 'YOUR_TOKEN'
 CHAT_ID = 'YOUR_ID'
 
 stats = {
-    "balance": 825.0,
+    "balance": 1000,
     "risk_percent": 0.02,
     "total_trades": 0,
     "wins_target": 0,   # Hits 1.85R Total
